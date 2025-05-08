@@ -10,7 +10,7 @@ The system consists of:
 - **Amazon DynamoDB Table (`Orders`)**: Stores order data with `orderId` as the partition key, using on-demand billing and AWS-managed encryption.
 - **Dead Letter Queue (`DeadLetterQueue`)**: Stores failed messages for debugging.
 
-![Architecture Diagram](https://github.com/your-username/your-repo/raw/main/images/architecture-diagram.png)
+![Architecture Diagram](https://github.com/omarsherif-11/aws_assignment_2/raw/main/images/architecture-diagram.png)
 
 ## Prerequisites
 
