@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation template for SNS, SQS, Lambda, and DynamoDB system for order processing
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment for resource naming (e.g., dev, staging, prod)
+
+Resources:
+  # SNS Topic
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: OrdersTopic
+      # No DisplayName as none was provided
+
+  # Dead Letter Queue (DLQ)
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: DeadLetterQueue
+      MessageRetentionPeriod: 345600 # 4 days, same as main queue
+      KmsMasterKeyId: alias/aws/sqs # Amazon SQS-managed key
+
+  # SQS Queue
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderQueue
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 345600 # 4 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+      KmsMasterKeyId: alias/aws/sqs # Amazon SQS-managed key
+
+  # SQS Queue Policy (allows SNS to publish)
+  SQSQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SQSQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSNSPublish
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt SQSQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref SNSTopic
+
+  # SNS Subscription
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SNSTopic
+      Endpoint: !GetAtt SQSQueue.Arn
+      Protocol: sqs
+      RawMessageDelivery: true
+
+  # DynamoDB Table
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Orders
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb # AWS-managed key
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaSQSDynamoDBPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt SQSQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt OrdersTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda Function
+  OrderProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: processOrder
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 3
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+          const { DynamoDBDocumentClient, PutCommand } = require("@aws-sdk/lib-dynamodb");
+          
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+          
+          exports.handler = async (event) => {
+              console.log('Received event:', JSON.stringify(event, null, 2));
+              
+              if (!event.Records || !Array.isArray(event.Records)) {
+                  console.error('Invalid event structure. Expected event.Records to be an array.');
+                  return {
+                      statusCode: 400,
+                      body: JSON.stringify('Invalid event structure')
+                  };
+              }
+              
+              for (const record of event.Records) {
+                  try {
+                      let messageBody = JSON.parse(record.body);
+                      let orderData = messageBody.Message ? JSON.parse(messageBody.Message) : messageBody;
+                      
+                      console.log(`Processing order: ${orderData.orderId}`);
+                      
+                      const requiredFields = ['orderId', 'userId', 'itemName', 'quantity', 'status'];
+                      for (const field of requiredFields) {
+                          if (!(field in orderData)) {
+                              throw new Error(`Missing required field: ${field}`);
+                          }
+                      }
+                      
+                      if (typeof orderData.quantity === 'string') {
+                          orderData.quantity = parseInt(orderData.quantity, 10);
+                      }
+                      
+                      const params = {
+                          TableName: 'Orders',
+                          Item: orderData
+                      };
+                      
+                      await docClient.send(new PutCommand(params));
+                      console.log(`Order saved to DynamoDB: ${orderData.orderId}`);
+                      
+                  } catch (error) {
+                      console.error(`Error processing message: ${error.message}`);
+                  }
+              }
+              
+              return {
+                  statusCode: 200,
+                  body: JSON.stringify('Order processing completed')
+              };
+          };
+
+  # Event Source Mapping (SQS to Lambda)
+  LambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt SQSQueue.Arn
+      FunctionName: !Ref OrderProcessorLambda
+      Enabled: true
+      BatchSize: 10
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+Outputs:
+  SNSTopicArn:
+    Description: ARN of the SNS Topic
+    Value: !Ref SNSTopic
+  SQSQueueUrl:
+    Description: URL of the SQS Queue
+    Value: !Ref SQSQueue
+  LambdaFunctionArn:
+    Description: ARN of the Lambda Function
+    Value: !Ref OrderProcessorLambda
+  DynamoDBTableName:
+    Description: Name of the DynamoDB Table
+    Value: !Ref OrdersTable
+  DeadLetterQueueArn:
+    Description: ARN of the Dead Letter Queue
+    Value: !GetAtt DeadLetterQueue.Arn
