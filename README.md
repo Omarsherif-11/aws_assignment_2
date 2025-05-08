@@ -1,1 +1,0 @@
-# aws_assignment_2
