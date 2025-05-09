@@ -1,0 +1,11 @@
+When the Lambda function pulls a message off the OrderQueue, the queue immediately puts that message “in flight” and hides it for the length of the visibility timeout (say, 30 seconds by default). During that window, no other consumer can see or re-process the same order. If the Lambda successfully writes the order into DynamoDB and acknowledges it before the timeout expires, SQS deletes the message and it's done. But if the function crashes, times out, or throws an error (for example, because DynamoDB was briefly unavailable), the message simply re-appears in the queue once the visibility timeout lapses—ready for another retry—rather than being lost outright.
+
+After a message fails to process n times (we set maxReceiveCount = 3), SQS automatically moves it to the Dead-Letter Queue (DLQ). This prevents endless retry loops on a corrupt message (perhaps malformed JSON, or missing a required field), and lets you isolate, inspect, and correct problematic orders without blocking healthy traffic. You can peek into the DLQ to see exactly which payloads failed, examine the error in CloudWatch Logs, then fix the code or sanitize incoming data.
+
+In short:
+
+Visibility Timeout gives the lambda function exclusive time to process each order, and guarantees at-least-once delivery even if transient errors occur.
+
+DLQ isolates repeatedly failing messages after the retry budget is spent, preserving system throughput and enabling targeted debugging.
+
+Together, they make the order-processing pipeline robust, reliable, and easy to operate.
