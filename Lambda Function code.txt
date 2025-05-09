@@ -1,0 +1,63 @@
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+
+const client = new DynamoDBClient({});
+const docClient = DynamoDBDocumentClient.from(client);
+
+export const handler = async (event) => {
+    console.log('Received event:', JSON.stringify(event, null, 2));
+    
+    if (!event.Records || !Array.isArray(event.Records)) {
+        console.error('Invalid event structure. Expected event.Records to be an array.');
+        return {
+            statusCode: 400,
+            body: JSON.stringify('Invalid event structure')
+        };
+    }
+    
+    // Process each record from SQS
+    for (const record of event.Records) {
+        try {
+            // Parse the message body
+            let messageBody = JSON.parse(record.body);
+            
+            let orderData;
+            if (messageBody.Message) {
+                orderData = JSON.parse(messageBody.Message);
+            } else {
+                orderData = messageBody;
+            }
+            
+            console.log(`Processing order: ${orderData.orderId}`);
+            
+            // Ensure all required fields are present
+            const requiredFields = ['orderId', 'userId', 'itemName', 'quantity', 'status'];
+            for (const field of requiredFields) {
+                if (!(field in orderData)) {
+                    throw new Error(`Missing required field: ${field}`);
+                }
+            }
+            
+            // Convert quantity to number for DynamoDB if it's a string
+            if (typeof orderData.quantity === 'string') {
+                orderData.quantity = parseInt(orderData.quantity, 10);
+            }
+            
+            const params = {
+                TableName: 'Orders',
+                Item: orderData
+            };
+            
+            await docClient.send(new PutCommand(params));
+            console.log(`Order saved to DynamoDB: ${orderData.orderId}`);
+            
+        } catch (error) {
+            console.error(`Error processing message: ${error.message}`);
+        }
+    }
+    
+    return {
+        statusCode: 200,
+        body: JSON.stringify('Order processing completed')
+    };
+};
